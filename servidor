@@ -2,21 +2,176 @@
 import asyncio
 from tcp import Servidor
 import re
+from base64 import b64decode
 
+
+buffer=b''
+nicknames={}
+channels={}
 
 def validar_nome(nome):
     return re.match(br'^[a-zA-Z][a-zA-Z0-9_-]*$', nome) is not None
 
 
 def sair(conexao):
+    membros = []
+    # :apelido QUIT :Connection closed
+    for chave, valor in nicknames.items():
+            if valor == conexao:
+                nick = chave
+    for channel in channels.values():
+        if conexao in channel:
+            channel.remove(conexao)
+            nicknames.pop(nick)
+            for connection in channel:
+                membros.append(connection)
+    
+    for membro in membros:
+        membro.enviar(b':%s QUIT :Connection closed\r\n' % nick)
+
     print(conexao, 'conexão fechada')
     conexao.fechar()
+    
 
 
 def dados_recebidos(conexao, dados):
+    global buffer
     if dados == b'':
         return sair(conexao)
     print(conexao, dados)
+    print(f'Dados {dados}')
+
+
+    messages=[]
+    buffer += dados
+    print(f'buffer {buffer}')
+    messages = buffer.split(b'\r\n')
+    for message in messages:
+        if message != b'':
+            if buffer[len(message):len(message)+2] == b'\r\n':
+                codigo = buffer.split(b' ',1)[0]
+                code_to_send = buffer[:len(message)+2]
+                if  codigo == b'PING':
+                    ping_exec(conexao, code_to_send)
+                elif codigo == b'NICK':
+                    nick_exec(conexao, code_to_send)
+                elif codigo == b'PRIVMSG':
+                    privmsg_exec(conexao, code_to_send)
+                elif codigo == b'JOIN':
+                    join_exec(conexao, code_to_send)
+                elif codigo == b'PART':
+                    part_exec(conexao, code_to_send)
+                buffer = buffer[len(message)+2:]
+
+
+
+
+
+
+def ping_exec(conexao, dados):
+
+            message_to_send = (dados.replace(b'PING ',b''))
+            #print(f'message {message_to_send}')
+            conexao.enviar(b':server PONG server :' + message_to_send)
+
+def nick_exec(conexao, dados):
+        nick_to_change=b''
+        connection_to_change=b''
+        nick_to_set = (dados.replace(b'NICK ',b'').replace(b'\r\n',b''))
+        for chave, valor in nicknames.items():
+            if valor == conexao:
+                nick_to_change = chave
+                connection_to_change = valor
+        #print(f'nickname: {nick_to_set}')
+        if (nick_to_set.lower() not in nicknames):
+            if (validar_nome(nick_to_set)):
+                if (conexao == connection_to_change):
+                    conexao.enviar(b':%s NICK %s\r\n' % (nick_to_change, nick_to_set))
+                    nicknames.pop(nick_to_change)
+                    nicknames[nick_to_set.lower()] = conexao
+                else:
+                    conexao.enviar(b':server 001 %s :Welcome\r\n' % nick_to_set)
+                    conexao.enviar(b':server 422 %s :MOTD File is missing\r\n' % nick_to_set)
+                    nicknames[nick_to_set.lower()] = conexao
+                
+            else:
+                conexao.enviar(b':server 432 * %s :Erroneous nickname\r\n' % nick_to_set)
+            
+        else:
+            # Verificar se esta conexão já tem algum nickname
+                if (connection_to_change == conexao):
+                    conexao.enviar(b':server 433 %s %s :Nickname is already in use\r\n' % (nick_to_change, nick_to_set))
+                else:
+                    conexao.enviar(b':server 433 * %s :Nickname is already in use\r\n' % (nick_to_set))
+                    
+def privmsg_exec(conexao, dados):
+    remetente = b''
+    # PRIVMSG destinatário :conteúdo
+    # :remetente PRIVMSG destinatário :conteúdo
+    dados = dados.replace(b'PRIVMSG ',b'').replace(b'\r\n',b'')
+    destinatario, mensagem = dados.split(b':')
+    destinatario = destinatario.replace(b' ',b'').lower()
+    for chave, valor in nicknames.items():
+            if valor == conexao:
+                remetente = chave
+    if destinatario.startswith(b'#'):
+        print(f'DESTINATARIO {destinatario}')
+        print(f'REMETENTE: {remetente}')
+        if destinatario in channels:
+            for person in channels[destinatario.lower()]:
+                if person != conexao:
+                    person.enviar(b':%s PRIVMSG %s :%s\r\n' % (remetente, destinatario, mensagem))
+                
+        else:
+            conexao.enviar(b':server 403 %s :No such channel\r\n' %destinatario)
+            
+    else:
+        
+        if remetente != b'':
+            if destinatario in nicknames:
+                conexao_dest = nicknames[destinatario]
+                conexao_dest.enviar(b':%s PRIVMSG %s :%s\r\n' % (remetente, destinatario, mensagem))
+
+
+def join_exec(conexao, code_to_send):
+    nicks_in_channel=[]
+    for chave, valor in nicknames.items():
+            if valor == conexao:
+                nick = chave
+    channel = code_to_send.replace(b'\r\n',b'').replace(b'JOIN ',b'').lower()
+    #if (validar_nome(channel)):
+    if channel not in channels.keys():
+        channels[channel] = []
+    if conexao not in channels[channel]:
+        channels[channel].append(conexao)
+        for conecc in channels[channel]:
+            conecc.enviar(b':%s JOIN :%s\r\n' % (nick, channel))
+        for chave, valor in nicknames.items():
+            if valor in channels[channel]:
+                nicks_in_channel.append(chave)
+        nicks_in_channel.sort()
+        nicks_conc = b' '.join(nicks_in_channel)
+        print(f'NICKS CONC {nicks_conc}')
+        # :server 353 apelido = canal :membro1 membro2 membro3
+        conexao.enviar(b':server 353 %s = %s :%s\r\n' % (nick, channel, nicks_conc))
+        # :server 366 apelido canal :End of /NAMES list.
+        conexao.enviar(b':server 366 %s %s :End of /NAMES list.\r\n' % (nick, channel))
+        print('enviou')
+
+    
+def part_exec(conexao, dados):
+    for chave, valor in nicknames.items():
+            if valor == conexao:
+                nick = chave
+    dados = dados.split(b':', 1)[0].replace(b' ',b'')
+    channel = dados.replace(b'\r\n',b'').replace(b'PART',b'')
+    print(f'CHANNEL {channel}')
+    if channel in channels.keys():
+        if conexao in channels[channel.lower()]:
+            for connection in channels[channel]:
+                connection.enviar(b':%s PART %s\r\n' % (nick, channel))
+            channels[channel.lower()].remove(conexao)
+
 
 
 def conexao_aceita(conexao):
@@ -27,3 +182,4 @@ def conexao_aceita(conexao):
 servidor = Servidor(6667)
 servidor.registrar_monitor_de_conexoes_aceitas(conexao_aceita)
 asyncio.get_event_loop().run_forever()
+
